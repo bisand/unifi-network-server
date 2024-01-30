@@ -1,4 +1,4 @@
-FROM ubuntu:23.10
+FROM ubuntu:23.10 AS base
 
 ARG UNIFI_VERSION=8.0.28
 ENV UNIFI_VERSION=${UNIFI_VERSION}
@@ -7,9 +7,9 @@ ENV UNIFI_VERSION=${UNIFI_VERSION}
 RUN sed -i 's/# deb/deb/g' /etc/apt/sources.list
 
 # Install dependencies
-RUN apt-get update && apt-get upgrade -y && apt-get install -y \
-    systemctl systemd-sysv \
-    ca-certificates \
+RUN apt-get update && apt-get upgrade -y && apt-get install -y systemctl 
+RUN apt-get install -y systemd-sysv
+RUN apt-get install -y ca-certificates \
     wget \
     openssh-server \
     && apt-get clean \
@@ -27,6 +27,8 @@ RUN apt-get update && apt-get upgrade -y && apt-get install -y \
     && rm -f /lib/systemd/system/systemd-update-utmp*
 
 VOLUME [ "/sys/fs/cgroup" ]
+
+FROM base AS unifi-install
 
 # Download and install UniFi
 RUN wget https://get.glennr.nl/unifi/install/unifi-${UNIFI_VERSION}.sh && \
