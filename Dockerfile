@@ -1,34 +1,20 @@
-FROM ubuntu:23.10 AS base
+
+FROM ubuntu:jammy 
 
 ARG UNIFI_VERSION=8.0.28
 ENV UNIFI_VERSION=${UNIFI_VERSION}
 
-# Enable apt repositories.
-RUN sed -i 's/# deb/deb/g' /etc/apt/sources.list
-
 # Install dependencies
-RUN apt-get update && apt-get upgrade -y && apt-get install -y systemctl 
-RUN apt-get install -y systemd-sysv
-RUN apt-get install -y ca-certificates \
+RUN apt-get update && apt-get upgrade -y \
+    && apt-get install -y ca-certificates \
     wget \
     openssh-server \
     && apt-get clean \
-    && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/* \
-    && cd /lib/systemd/system/sysinit.target.wants/ \
-    && ls | grep -v systemd-tmpfiles-setup | xargs rm -f $1 \
-    && rm -f /lib/systemd/system/multi-user.target.wants/* \
-    && rm -f /etc/systemd/system/*.wants/* \
-    && rm -f /lib/systemd/system/local-fs.target.wants/* \
-    && rm -f /lib/systemd/system/sockets.target.wants/*udev* \
-    && rm -f /lib/systemd/system/sockets.target.wants/*initctl* \
-    && rm -f /lib/systemd/system/basic.target.wants/* \
-    && rm -f /lib/systemd/system/anaconda.target.wants/* \
-    && rm -f /lib/systemd/system/plymouth* \
-    && rm -f /lib/systemd/system/systemd-update-utmp*
+    && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
-VOLUME [ "/sys/fs/cgroup" ]
-
-FROM base AS unifi-install
+# Download and install alternate systemctl
+RUN wget https://raw.githubusercontent.com/gdraheim/docker-systemctl-replacement/master/files/docker/systemctl3.py -O /usr/local/bin/systemctl
+RUN chmod +x /usr/local/bin/systemctl
 
 # Download and install UniFi
 RUN wget https://get.glennr.nl/unifi/install/unifi-${UNIFI_VERSION}.sh && \
@@ -46,8 +32,18 @@ RUN rm -rf unifi-${UNIFI_VERSION}.sh && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
-# Expose ports
+# Expose TCP ports
 EXPOSE 8080 8443 8880 8843
+# Expose UDP ports
+EXPOSE 3478/udp 10001/udp 1900/udp
 
-# Start UniFi
-CMD ["java", "-jar", "/usr/lib/unifi/lib/ace.jar", "start"]
+# Make sure service mongod and unifi are started
+RUN systemctl enable mongod && \
+    systemctl enable unifi
+
+# Copy entrypoint script
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+# Start docker with just an infinite pause
+CMD ["/entrypoint.sh"]

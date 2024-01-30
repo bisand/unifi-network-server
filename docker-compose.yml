@@ -1,0 +1,30 @@
+version: '3.8'
+services:
+  network-server:
+    image: bisand/unifi-network-server:latest
+    ports:
+      - 8080:8080
+      - 8443:8443
+      - 8880:8880
+      - 8843:8843
+      - 3478:3478/udp
+      - 10001:10001/udp
+    volumes:
+      - unifi-data:/var/lib/unifi
+      - mongodb-data:/var/lib/mongodb
+
+volumes:
+  unifi-data:
+    driver: local
+    # NFS mount for unifi data (Comment out and modify driver_opts if using NFS)
+    # driver_opts:
+    #   type: nfs
+    #   o: nfsvers=4,addr=X.X.X.X,rw,noatime,nolock,rsize=32768,wsize=32768,tcp,timeo=14
+    #   device: ":/srv/nfs/unifi/unifi-data"
+  mongodb-data:
+    driver: local
+    # NFS mount for mongodb data (Comment out and modify driver_opts if using NFS)
+    # driver_opts:
+    #   type: nfs
+    #   o: nfsvers=4,addr=X.X.X.X,rw,noatime,nolock,rsize=32768,wsize=32768,tcp,timeo=14
+    #   device: ":/srv/nfs/unifi/mongodb-data"
