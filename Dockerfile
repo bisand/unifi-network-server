@@ -1,7 +1,7 @@
 
-FROM ubuntu:jammy 
+FROM ubuntu:noble 
 
-ARG UNIFI_VERSION=8.0.28
+ARG UNIFI_VERSION=8.3.32
 ENV UNIFI_VERSION=${UNIFI_VERSION}
 
 # Install dependencies
@@ -21,8 +21,7 @@ RUN wget https://get.glennr.nl/unifi/install/unifi-${UNIFI_VERSION}.sh && \
     chmod +x unifi-${UNIFI_VERSION}.sh && \
     ./unifi-${UNIFI_VERSION}.sh \
     --skip \
-    --local-install \
-    --custom-url https://dl.ui.com/unifi/${UNIFI_VERSION}/unifi_sysvinit_all.deb
+    --local-install
 
 # Clean up
 RUN rm -rf unifi-${UNIFI_VERSION}.sh && \

@@ -1,5 +1,9 @@
 #!/bin/bash
 
+# Set permissions
+chown -R unifi /var/lib/unifi /var/log/unifi /var/run/unifi
+chown -R mongodb /var/lib/mongodb
+
 # Start mongod service
 echo "Starting mongod service..."
 systemctl start mongod
