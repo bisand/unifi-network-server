@@ -1,7 +1,7 @@
 
-FROM ubuntu:noble 
+FROM ubuntu:noble
 
-ARG UNIFI_VERSION=8.3.32
+ARG UNIFI_VERSION
 ENV UNIFI_VERSION=${UNIFI_VERSION}
 
 # Install dependencies
