@@ -2,6 +2,12 @@ version: '3.8'
 services:
   network-server:
     image: bisand/unifi-network-server:latest
+    deploy:
+      placement:
+        constraints: [node.labels.AVX == true ] # Only deploy on nodes with AVX support (Intel Xeon E5-26xx v3 or newer)
+      restart_policy:
+        condition: on-failure
+        delay: 10s
     ports:
       - 8080:8080
       - 8443:8443

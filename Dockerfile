@@ -1,5 +1,5 @@
 
-FROM ubuntu:noble
+FROM ubuntu:jammy
 
 ARG UNIFI_VERSION
 ENV UNIFI_VERSION=${UNIFI_VERSION}
