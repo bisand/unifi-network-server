@@ -1,0 +1,53 @@
+name: Check UniFi Network Controller Version
+
+on:
+  schedule:
+    - cron: '0 3 * * *' # Runs daily at 03:00 UTC
+
+jobs:
+  check-version:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Download install page
+        run: curl -sSL -o unifi-install.html https://glennr.nl/s/unifi-network-controller
+
+      - name: Extract latest UniFi Network Application version
+        id: extract_version
+        run: |
+          # Extract all version numbers from the installation script links
+          VERSION=$(grep -oP 'unifi-\K[0-9]+\.[0-9]+\.[0-9]+' unifi-install.html | sort -V | tail -n1)
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Compare with current version
+        id: compare
+        run: |
+          CURRENT_VERSION=$(cat UNIFI_VERSION)
+          if [ "${{ steps.extract_version.outputs.version }}" != "$CURRENT_VERSION" ]; then
+            echo "new_version=true" >> $GITHUB_OUTPUT
+          else
+            echo "new_version=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Update UNIFI_VERSION file
+        if: steps.compare.outputs.new_version == 'true'
+        run: echo "${{ steps.extract_version.outputs.version }}" > UNIFI_VERSION
+
+      - name: Commit and push changes
+        if: steps.compare.outputs.new_version == 'true'
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add UNIFI_VERSION
+          git commit -m "chore: update UNIFI_VERSION to ${{ steps.extract_version.outputs.version }}"
+          git push
+
+      - name: Make script executable
+        if: steps.compare.outputs.new_version == 'true'
+        run: chmod +x ./docker-build-publish.sh
+
+      - name: Build and publish Docker image
+        if: steps.compare.outputs.new_version == 'true'
+        run: ./docker-build-publish.sh
