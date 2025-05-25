@@ -51,4 +51,12 @@ jobs:
 
       - name: Build and publish Docker image
         if: steps.compare.outputs.new_version == 'true'
+        id: build_and_publish
         run: ./docker-build-publish.sh
+
+      - name: Trigger Portainer webhook
+        if: steps.build_and_publish.outcome == 'success' && steps.compare.outputs.new_version == 'true'
+        env:
+          PORTAINER_WEBHOOK_URL: ${{ secrets.PORTAINER_WEBHOOK_URL }}
+        run: |
+          curl -X POST "$PORTAINER_WEBHOOK_URL"
