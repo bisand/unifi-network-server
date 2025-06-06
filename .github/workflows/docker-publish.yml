@@ -5,12 +5,17 @@ on:
   schedule:
     - cron: '0 3 * * *' # Runs daily at 03:00 UTC
 
+permissions:
+  contents: write
+
 jobs:
   check-version:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v3
+        with:
+          persist-credentials: true
 
       - name: Download install page
         run: curl -sSL -o unifi-install.html https://glennr.nl/s/unifi-network-controller
