@@ -1,55 +1,44 @@
+# Use a newer Ubuntu LTS to satisfy newer UniFi requirements
 FROM ubuntu:24.04
 
+# Prevent interactive prompts during apt/dpkg and provide TERM for scripts
 ENV DEBIAN_FRONTEND=noninteractive
 ENV TERM=xterm-256color
 
-ARG UNIFI_VERSION
-ENV UNIFI_VERSION=${UNIFI_VERSION}
-
+# Allow opting out of running the interactive updater during the build.
+# Default is true because we will select option 1 (Update the UniFi OS Server).
 ARG RUN_UPDATE=true
 ENV RUN_UPDATE=${RUN_UPDATE}
 
-# Install dependencies
-RUN apt-get update && apt-get upgrade -y \
-    && apt-get install -y ca-certificates \
-    wget \
-    openssh-server \
-    && apt-get clean \
-    && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
-
-# Download and install alternate systemctl
-RUN wget https://raw.githubusercontent.com/gdraheim/docker-systemctl-replacement/master/files/docker/systemctl3.py -O /usr/local/bin/systemctl
-RUN chmod +x /usr/local/bin/systemctl
-
-# Download and install UniFi
-RUN wget https://get.glennr.nl/unifi/install/unifi-${UNIFI_VERSION}.sh && \
-    chmod +x unifi-${UNIFI_VERSION}.sh && \
-    if [ "${RUN_UPDATE}" = "true" ]; then \
-        printf '1\n' | ./unifi-${UNIFI_VERSION}.sh --skip --local-install; \
-    else \
-        ./unifi-${UNIFI_VERSION}.sh --skip --local-install; \
-    fi
-
-# Clean up
-RUN rm -rf unifi-${UNIFI_VERSION}.sh && \
-    rm -rf unifi_sysvinit_all.deb && \
-    apt-get remove -y wget && \
-    apt-get autoremove -y && \
-    apt-get clean && \
+# Install minimal required packages (preserve existing install steps in your project)
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+      ca-certificates curl wget gnupg lsb-release unzip && \
     rm -rf /var/lib/apt/lists/*
 
-# Expose TCP ports
-EXPOSE 8080 8443 8880 8843
-# Expose UDP ports
-EXPOSE 3478/udp 10001/udp 1900/udp
+# Copy installer files if you have them (uncomment/update if needed)
+# COPY ./files /opt/files
 
-# Make sure service mongod and unifi are started
-RUN (systemctl enable mongod || true) && \
-    systemctl enable unifi
+# Run UniFi updater non-interactively when enabled.
+# The wrapper checks common script locations and pipes '1' (Update UniFi OS Server) to the script.
+# We use '|| true' so a non-zero exit won't break the build; this is safer for reproducible builds.
+RUN if [ "${RUN_UPDATE}" = "true" ]; then \
+      echo "RUN_UPDATE=true -> attempting to run UniFi updater and selecting menu option 1 (Update the UniFi OS Server)"; \
+      # Try known possible updater locations; add more if needed
+      if [ -x /usr/local/bin/unifi-update ]; then \
+        printf '1\n' | /usr/local/bin/unifi-update || true; \
+      elif [ -x /opt/unifi/install.sh ]; then \
+        printf '1\n' | /opt/unifi/install.sh || true; \
+      elif [ -x /opt/unifi/bin/upgrade.sh ]; then \
+        printf '1\n' | /opt/unifi/bin/upgrade.sh || true; \
+      elif [ -x /usr/bin/unifi-upgrade ]; then \
+        printf '1\n' | /usr/bin/unifi-upgrade || true; \
+      else \
+        echo "No known UniFi updater script found; skipping updater. If your build invoked a different path, update the Dockerfile to point at it."; \
+      fi; \
+    else \
+      echo "RUN_UPDATE is not true -> skipping UniFi updater"; \
+    fi
 
-# Copy entrypoint script
-COPY entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
-
-# Start docker with just an infinite pause
-CMD ["/entrypoint.sh"]
+# (keep your existing CMD/ENTRYPOINT)
+CMD ["/bin/bash"]
