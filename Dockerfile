@@ -13,6 +13,7 @@ ENV RUN_UPDATE=${RUN_UPDATE}
 RUN apt-get update && apt-get upgrade -y \
     && apt-get install -y --no-install-recommends \
       ca-certificates \
+      iproute2 \
       wget \
       openssh-server \
       expect \
