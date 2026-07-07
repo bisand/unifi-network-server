@@ -1,19 +1,36 @@
 #!/bin/bash
+#
+# Local build & publish helper. CI (.github/workflows/docker-publish.yml) is the
+# primary path; use this for manual/local builds.
+#
+# Usage:
+#   ./docker-build-publish.sh            # build the version in ./UNIFI_VERSION
+#   ./docker-build-publish.sh 10.5.54    # build a specific version
+set -euo pipefail
 
-# Read the version from the UNIFI_VERSION file
-UNIFI_VERSION=$(cat UNIFI_VERSION)
+IMAGE="bisand/unifi-network-server"
 
-# Build the Docker image with the version tag and pass the version as a build argument
-docker build --build-arg UNIFI_VERSION=$UNIFI_VERSION -t bisand/unifi-network-server:$UNIFI_VERSION .
+# Version from the first argument, otherwise from the UNIFI_VERSION file.
+UNIFI_VERSION="${1:-$(tr -d '[:space:]' < UNIFI_VERSION)}"
 
-# Tag the Docker image with the 'latest' tag
-docker tag bisand/unifi-network-server:$UNIFI_VERSION bisand/unifi-network-server:latest
+if [ -z "$UNIFI_VERSION" ]; then
+  echo "ERROR: no UniFi version given and UNIFI_VERSION file is empty." >&2
+  exit 1
+fi
 
-# Login to Docker Hub
+echo "Building ${IMAGE}:${UNIFI_VERSION} (linux/amd64)..."
+docker build \
+  --platform linux/amd64 \
+  --build-arg "UNIFI_VERSION=${UNIFI_VERSION}" \
+  -t "${IMAGE}:${UNIFI_VERSION}" \
+  -t "${IMAGE}:latest" \
+  .
+
+# Login to Docker Hub (uncomment if not already logged in)
 # echo "$DOCKER_PASSWORD" | docker login -u "$DOCKER_USERNAME" --password-stdin
 
-# Push the Docker image with the version tag to Docker Hub
-docker push bisand/unifi-network-server:$UNIFI_VERSION
+echo "Pushing ${IMAGE}:${UNIFI_VERSION} and :latest..."
+docker push "${IMAGE}:${UNIFI_VERSION}"
+docker push "${IMAGE}:latest"
 
-# Push the Docker image with the 'latest' tag to Docker Hub
-docker push bisand/unifi-network-server:latest
+echo "Done."
