@@ -12,7 +12,7 @@ on:
         type: boolean
         default: false
       skip_deploy:
-        description: 'Build and push only — do not update the homelab manifest'
+        description: 'Build and push only — do not update the deploy manifest'
         type: boolean
         default: false
   schedule:
@@ -28,13 +28,17 @@ concurrency:
 
 env:
   IMAGE: bisand/unifi-network-server
-  # The GitOps repo Flux reconciles the cluster from. Committing the new image
-  # reference there IS the deploy — the cluster pulls, this workflow never
-  # reaches it, and no kubeconfig exists in GitHub. Same shape as regnmed's
-  # images.yml, which is the established pattern for this homelab.
-  HOMELAB_REPO: ssh://git@github.com/bisand/homelab.git
-  HOMELAB_BRANCH: master
-  HOMELAB_MANIFEST: stacks/unifi/unifi.yaml
+  # Coordinates of the private GitOps repo whose manifests a Flux cluster
+  # reconciles. Committing the new image reference there IS the deploy — the
+  # cluster pulls, this workflow never reaches it, and no kubeconfig exists in
+  # GitHub.
+  #
+  # These are secrets rather than literals ONLY so this public repository does
+  # not publish the private repo's name, branch and internal layout — and
+  # because Actions masks secret values in logs, which are public here too.
+  DEPLOY_REPO: ${{ secrets.DEPLOY_REPO }}
+  DEPLOY_BRANCH: ${{ secrets.DEPLOY_BRANCH }}
+  DEPLOY_MANIFEST: ${{ secrets.DEPLOY_MANIFEST }}
 
 jobs:
   build-publish:
@@ -173,7 +177,7 @@ jobs:
           TAG="${{ steps.version.outputs.target }}"
           docker buildx imagetools create -t "${IMAGE}:latest" "${IMAGE}:${TAG}"
 
-      # The homelab manifest pins by digest, not by tag, so the deploy needs the
+      # The deploy manifest pins by digest, not by tag, so the deploy needs the
       # digest whether we just built the image or found it already published.
       - name: Resolve image digest
         id: digest
@@ -192,10 +196,14 @@ jobs:
           echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
           echo "Deploying ${IMAGE}:${TAG}@${DIGEST}"
 
-      # This commit IS the deploy. Flux polls the homelab repo every minute and
-      # reconciles ./stacks every five, so the rollout lands within ~5 minutes
-      # with nothing inbound to the cluster and no kubeconfig in GitHub.
-      - name: Deploy — pin the new image in the homelab repo
+      # This commit IS the deploy. Flux polls that repo every minute and
+      # reconciles every five, so the rollout lands within ~5 minutes with
+      # nothing inbound to the cluster and no kubeconfig in GitHub.
+      #
+      # Nothing here echoes the repo, branch or manifest path. They are secrets,
+      # so Actions would mask them anyway, but this repository is public and so
+      # are its run logs — do not rely on masking alone.
+      - name: Deploy — pin the new image in the GitOps repo
         id: deploy
         if: steps.version.outputs.should_run == 'true' && github.event.inputs.skip_deploy != 'true'
         env:
@@ -204,48 +212,49 @@ jobs:
           DIGEST: ${{ steps.digest.outputs.digest }}
         run: |
           set -euo pipefail
-          if [ -z "${DEPLOY_KEY:-}" ]; then
-            echo "::error::HOMELAB_DEPLOY_KEY secret is not set — see the Build pipeline section of README.md for how to create it."
-            exit 1
-          fi
+          for v in DEPLOY_KEY DEPLOY_REPO DEPLOY_BRANCH DEPLOY_MANIFEST; do
+            eval "val=\${$v:-}"
+            if [ -z "$val" ]; then
+              echo "::error::Secret $v is not set — see the Build pipeline section of README.md."
+              exit 1
+            fi
+          done
 
           mkdir -p ~/.ssh && chmod 700 ~/.ssh
           printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
           ssh-keyscan -t rsa,ecdsa,ed25519 github.com >> ~/.ssh/known_hosts 2>/dev/null
 
-          CLONE="$RUNNER_TEMP/homelab"
+          CLONE="$RUNNER_TEMP/gitops"
           rm -rf "$CLONE"
-          git clone --depth 1 --branch "$HOMELAB_BRANCH" "$HOMELAB_REPO" "$CLONE"
+          git clone --quiet --depth 1 --branch "$DEPLOY_BRANCH" "$DEPLOY_REPO" "$CLONE"
 
           REF="${IMAGE}:${TAG}@${DIGEST}"
-          python3 .github/scripts/pin-image.py "$CLONE/$HOMELAB_MANIFEST" "$IMAGE" "$REF"
+          python3 .github/scripts/pin-image.py "$CLONE/$DEPLOY_MANIFEST" "$IMAGE" "$REF" >/dev/null
 
           cd "$CLONE"
           if git diff --quiet; then
-            echo "$HOMELAB_MANIFEST already pins ${REF} — nothing to deploy."
+            echo "The manifest already pins ${REF} — nothing to deploy."
             exit 0
           fi
-          git --no-pager diff -- "$HOMELAB_MANIFEST"
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add "$HOMELAB_MANIFEST"
-          git commit -m "unifi: deploy ${TAG}" \
+          git add "$DEPLOY_MANIFEST"
+          git commit --quiet -m "unifi: deploy ${TAG}" \
                      -m "Image ${REF}, published by unifi-network-server run ${GITHUB_RUN_ID}."
 
-          # The homelab repo has other authors; rebase rather than fail on a race.
+          # That repo has other authors; rebase rather than fail on a race.
           for attempt in 1 2 3; do
-            if git push origin "HEAD:$HOMELAB_BRANCH"; then
+            if git push --quiet origin "HEAD:$DEPLOY_BRANCH"; then
               echo "Deployed ${REF} — Flux reconciles within ~5 minutes."
               exit 0
             fi
-            echo "Push rejected (attempt ${attempt}/3); rebasing onto $HOMELAB_BRANCH..."
-            git fetch origin "$HOMELAB_BRANCH"
-            git pull --rebase origin "$HOMELAB_BRANCH"
+            echo "Push rejected (attempt ${attempt}/3); rebasing and retrying..."
+            git fetch --quiet origin "$DEPLOY_BRANCH"
+            git pull --quiet --rebase origin "$DEPLOY_BRANCH"
           done
-          echo "::error::Could not push the deploy commit to $HOMELAB_BRANCH after 3 attempts. UNIFI_VERSION is left untouched, so the next run will retry."
+          echo "::error::Could not push the deploy commit after 3 attempts. UNIFI_VERSION is left untouched, so the next run will retry."
           exit 1
-
 
       # Runs only when every step above succeeded, so UNIFI_VERSION always reflects
       # a version that is both published and deployed. Never bump it earlier.

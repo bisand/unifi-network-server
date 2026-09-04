@@ -53,11 +53,11 @@ volumes:
 
 `.github/workflows/docker-publish.yml` checks [glennr.nl](https://glennr.nl/s/unifi-network-controller)
 nightly, builds and pushes `bisand/unifi-network-server:<version>` + `:latest`, then deploys by
-committing the new image reference into the homelab GitOps repo.
+committing the new image reference into a GitOps repository.
 
 **The cluster pulls; CI never reaches it.** The deploy step writes
-`image: bisand/unifi-network-server:<version>@sha256:<digest>` into `stacks/unifi/unifi.yaml` in
-`bisand/homelab`, and Flux reconciles it within ~5 minutes. Nothing inbound to the cluster, and no
+`image: bisand/unifi-network-server:<version>@sha256:<digest>` into a manifest in that repository,
+and [Flux](https://fluxcd.io) reconciles it within ~5 minutes. Nothing inbound to the cluster, and no
 kubeconfig exists in GitHub. The digest is what actually pins the rollout — the tag alongside it is
 there so the manifest says which version it is running.
 
@@ -66,17 +66,24 @@ committed only by the final step. Any run that fails leaves it untouched, so the
 retries; if the image for that version is already on Docker Hub, the rebuild is skipped and only the
 deploy is retried.
 
-| Setting | Kind | Required | Purpose |
-| --- | --- | --- | --- |
-| `DOCKERHUB_USERNAME` / `DOCKERHUB_TOKEN` | secret | yes | Docker Hub push credentials |
-| `HOMELAB_DEPLOY_KEY` | secret | yes | SSH private key with **write** access to `bisand/homelab`, so the deploy step can commit the image reference |
+This repository is public, so the deploy target is configured entirely through secrets. Nothing about
+the private infrastructure — its repository, branch, layout or addresses — belongs in these files or
+in the run logs they produce.
 
-`HOMELAB_DEPLOY_KEY` is separate from the read-only key Flux uses to *read* that repo — this one
-writes, and only to the one manifest. To create it:
+| Setting | Kind | Purpose |
+| --- | --- | --- |
+| `DOCKERHUB_USERNAME` / `DOCKERHUB_TOKEN` | secret | Docker Hub push credentials |
+| `HOMELAB_DEPLOY_KEY` | secret | SSH private key with **write** access to the GitOps repository |
+| `DEPLOY_REPO` | secret | Clone URL of that repository, e.g. `ssh://git@github.com/<owner>/<repo>.git` |
+| `DEPLOY_BRANCH` | secret | Branch Flux tracks |
+| `DEPLOY_MANIFEST` | secret | Path within that repository to the manifest holding the image line |
+
+The deploy key is separate from, and should not be reused from, the read-only key Flux uses to *read*
+that repository — this one writes. To create it:
 
 ```bash
-ssh-keygen -t ed25519 -C "unifi-network-server CI" -f ./homelab-ci -N ""
+ssh-keygen -t ed25519 -C "unifi-network-server CI" -f ./ci-deploy -N ""
 ```
 
-Add `homelab-ci.pub` to `bisand/homelab` under Settings → Deploy keys with **Allow write access**
+Add `ci-deploy.pub` to the GitOps repository under Settings → Deploy keys with **Allow write access**
 checked, add the private half as the `HOMELAB_DEPLOY_KEY` secret here, then delete both local files.

@@ -2,7 +2,7 @@
 """Pin an image reference in a Kubernetes manifest.
 
 Used by .github/workflows/docker-publish.yml to write the freshly published
-image into the homelab GitOps repo. That commit is the deploy: Flux reconciles
+image into the GitOps repo. That commit is the deploy: Flux reconciles
 it, so this rewrite has to be exact or it silently deploys the wrong thing.
 
 Rewrites the single `image:` line naming the given repository, whatever it is

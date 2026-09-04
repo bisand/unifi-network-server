@@ -1,4 +1,7 @@
-
 # CI deploy key — never commit
+ci-deploy
+ci-deploy.pub
 homelab-ci
 homelab-ci.pub
+*.pem
+id_ed25519*
