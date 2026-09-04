@@ -35,7 +35,7 @@ if ! systemctl start unifi; then
 fi
 echo "Done!"
 
-# Follow UniFi logs so they show up in `docker logs` / Portainer console.
+# Follow UniFi logs so they show up in `docker logs` / `kubectl logs`.
 touch /var/log/unifi/server.log 2>/dev/null || true
 tail -F /var/log/unifi/*.log 2>/dev/null &
 
