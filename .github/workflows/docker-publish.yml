@@ -1,14 +1,22 @@
 name: Build & Publish UniFi Network Server
 
 on:
-  workflow_dispatch:      # Manual trigger (always builds & publishes)
+  workflow_dispatch:      # Manual trigger (always runs; retries whatever is missing)
     inputs:
       version:
         description: 'UniFi version to build (leave blank to auto-detect the latest)'
         type: string
         default: ''
+      force_rebuild:
+        description: 'Rebuild and push even if this tag is already on Docker Hub'
+        type: boolean
+        default: false
+      skip_deploy:
+        description: 'Skip the Portainer redeploy'
+        type: boolean
+        default: false
   schedule:
-    - cron: '0 3 * * *'   # Daily at 03:00 UTC — only builds when a newer version exists
+    - cron: '0 3 * * *'   # Daily at 03:00 UTC
 
 permissions:
   contents: write
@@ -18,61 +26,124 @@ concurrency:
   group: publish-unifi
   cancel-in-progress: false
 
+env:
+  IMAGE: bisand/unifi-network-server
+
 jobs:
   build-publish:
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           persist-credentials: true
 
+      # UNIFI_VERSION is the "last version that was published AND deployed successfully".
+      # It is only bumped by the final step of this workflow, so any run that fails
+      # anywhere leaves it behind and the next nightly run retries the whole thing.
       - name: Determine target version
         id: version
         run: |
           set -euo pipefail
           CURRENT="$(tr -d '[:space:]' < UNIFI_VERSION)"
           OVERRIDE="${{ github.event.inputs.version }}"
+
           if [ -n "$OVERRIDE" ]; then
             TARGET="$OVERRIDE"
             echo "Using version override: $TARGET"
           else
-            curl -sSL -o unifi-install.html https://glennr.nl/s/unifi-network-controller
-            TARGET="$(grep -oP 'unifi-\K[0-9]+\.[0-9]+\.[0-9]+' unifi-install.html | sort -V | tail -n1)"
-            echo "Latest detected version: $TARGET"
+            # Retry the version feed — a transient fetch failure must not look like
+            # "no new version" and must not fail the run outright on the first try.
+            TARGET=""
+            for attempt in 1 2 3 4 5; do
+              if curl -sSL --max-time 60 -o unifi-install.html https://glennr.nl/s/unifi-network-controller; then
+                TARGET="$(grep -oP 'unifi-\K[0-9]+\.[0-9]+\.[0-9]+' unifi-install.html | sort -V | tail -n1 || true)"
+                if [ -n "$TARGET" ]; then break; fi
+              fi
+              echo "Version detection failed (attempt ${attempt}/5); retrying in $((attempt * 10))s..."
+              sleep $((attempt * 10))
+            done
+            rm -f unifi-install.html
+            echo "Latest detected version: ${TARGET:-<none>}"
           fi
-          if [ -z "$TARGET" ]; then
-            echo "::error::Could not determine a target UniFi version" >&2
+
+          if ! printf '%s' "$TARGET" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::Could not determine a valid target UniFi version (got '${TARGET}')"
             exit 1
           fi
-          # Build on every manual dispatch, or when the detected version is newer than the committed one.
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] || [ "$TARGET" != "$CURRENT" ]; then
-            SHOULD_BUILD=true
-          else
-            SHOULD_BUILD=false
+
+          # A bad parse of the feed must never downgrade :latest. Only an explicit
+          # override may move the version backwards.
+          NEWEST="$(printf '%s\n%s\n' "$CURRENT" "$TARGET" | sort -V | tail -n1)"
+          if [ -z "$OVERRIDE" ] && [ "$TARGET" != "$CURRENT" ] && [ "$NEWEST" != "$TARGET" ]; then
+            echo "::warning::Detected version $TARGET is older than the current $CURRENT — ignoring."
+            TARGET="$CURRENT"
           fi
-          echo "current=$CURRENT"           >> "$GITHUB_OUTPUT"
-          echo "target=$TARGET"             >> "$GITHUB_OUTPUT"
-          echo "should_build=$SHOULD_BUILD" >> "$GITHUB_OUTPUT"
-          echo "### UniFi publish" >> "$GITHUB_STEP_SUMMARY"
-          echo "- current: \`$CURRENT\`"     >> "$GITHUB_STEP_SUMMARY"
-          echo "- target:  \`$TARGET\`"      >> "$GITHUB_STEP_SUMMARY"
-          echo "- build:   \`$SHOULD_BUILD\`" >> "$GITHUB_STEP_SUMMARY"
+
+          # Confirm the installer for this version actually exists before we spend
+          # 5 minutes building an image around a version that cannot be installed.
+          if [ "$TARGET" != "$CURRENT" ] || [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            if ! curl -fsSI --max-time 60 --retry 3 --retry-delay 5 \
+                 "https://get.glennr.nl/unifi/install/unifi-${TARGET}.sh" >/dev/null; then
+              echo "::error::No installer available at https://get.glennr.nl/unifi/install/unifi-${TARGET}.sh"
+              exit 1
+            fi
+          fi
+
+          # Run on every manual dispatch, or whenever the last fully successful
+          # version differs from the target (new release, or an earlier failed run).
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] || [ "$TARGET" != "$CURRENT" ]; then
+            SHOULD_RUN=true
+          else
+            SHOULD_RUN=false
+          fi
+
+          echo "current=$CURRENT"       >> "$GITHUB_OUTPUT"
+          echo "target=$TARGET"         >> "$GITHUB_OUTPUT"
+          echo "should_run=$SHOULD_RUN" >> "$GITHUB_OUTPUT"
+          {
+            echo "### UniFi publish"
+            echo "- last successful: \`$CURRENT\`"
+            echo "- target:          \`$TARGET\`"
+            echo "- run:             \`$SHOULD_RUN\`"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Set up Docker Buildx
-        if: steps.version.outputs.should_build == 'true'
+        if: steps.version.outputs.should_run == 'true'
         uses: docker/setup-buildx-action@v3
 
       - name: Log in to Docker Hub
-        if: steps.version.outputs.should_build == 'true'
+        if: steps.version.outputs.should_run == 'true'
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      # Retrying a run that only failed at the deploy step should not rebuild the
+      # image: if the tag is already on Docker Hub, go straight to the redeploy.
+      - name: Check whether the tag is already published
+        id: published
+        if: steps.version.outputs.should_run == 'true'
+        run: |
+          set -uo pipefail
+          TAG="${{ steps.version.outputs.target }}"
+          if [ "${{ github.event.inputs.force_rebuild }}" = "true" ]; then
+            echo "force_rebuild requested — building regardless."
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if docker buildx imagetools inspect "${IMAGE}:${TAG}" >/dev/null 2>&1; then
+            echo "${IMAGE}:${TAG} is already published — skipping the build."
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "${IMAGE}:${TAG} is not published yet."
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Build and push image
         id: build
-        if: steps.version.outputs.should_build == 'true'
+        if: steps.version.outputs.should_run == 'true' && steps.published.outputs.exists != 'true'
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -81,15 +152,81 @@ jobs:
           build-args: |
             UNIFI_VERSION=${{ steps.version.outputs.target }}
           tags: |
-            bisand/unifi-network-server:${{ steps.version.outputs.target }}
-            bisand/unifi-network-server:latest
+            ${{ env.IMAGE }}:${{ steps.version.outputs.target }}
+            ${{ env.IMAGE }}:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # Only reached when the build+push above succeeded (implicit success() gate).
-      # Commit the version bump AFTER a successful publish, never before.
+      # An already-published tag still needs :latest pointing at it — cheap manifest
+      # copy, no rebuild.
+      - name: Retag latest
+        if: steps.version.outputs.should_run == 'true' && steps.published.outputs.exists == 'true'
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.version.outputs.target }}"
+          docker buildx imagetools create -t "${IMAGE}:latest" "${IMAGE}:${TAG}"
+
+      - name: Trigger Portainer redeploy
+        id: deploy
+        if: steps.version.outputs.should_run == 'true' && github.event.inputs.skip_deploy != 'true'
+        env:
+          WEBHOOK: ${{ secrets.PORTAINER_WEBHOOK_URL }}
+          # Optional: PEM of the CA that signed Portainer's certificate.
+          CA_CERT: ${{ secrets.PORTAINER_CA_CERT }}
+          # Set the repo variable to 'false' to make an untrusted certificate fatal.
+          ALLOW_INSECURE: ${{ vars.PORTAINER_INSECURE_TLS }}
+        run: |
+          set -uo pipefail
+          if [ -z "${WEBHOOK:-}" ]; then
+            echo "::error::PORTAINER_WEBHOOK_URL secret is not set."
+            exit 1
+          fi
+
+          TLS_OPTS=()
+          if [ -n "${CA_CERT:-}" ]; then
+            printf '%s\n' "$CA_CERT" > "$RUNNER_TEMP/portainer-ca.pem"
+            TLS_OPTS=(--cacert "$RUNNER_TEMP/portainer-ca.pem")
+          fi
+
+          post() {
+            curl -fsS -X POST --max-time 120 \
+              --retry 3 --retry-delay 5 --retry-all-errors "$@" "$WEBHOOK"
+          }
+
+          for attempt in 1 2 3 4 5; do
+            rc=0
+            post "${TLS_OPTS[@]}" || rc=$?
+            if [ "$rc" -eq 0 ]; then
+              echo "Portainer webhook triggered."
+              exit 0
+            fi
+
+            # curl 60 = the server's certificate could not be verified. Portainer
+            # commonly runs with a self-signed cert; retry unverified unless the
+            # repo has explicitly opted out.
+            if [ "$rc" -eq 60 ] && [ "${ALLOW_INSECURE:-}" != "false" ]; then
+              echo "::warning::Portainer presented an untrusted certificate. Retrying without TLS verification. Set the PORTAINER_CA_CERT secret to pin its CA, or the PORTAINER_INSECURE_TLS repository variable to 'false' to make this fatal."
+              rc=0
+              post -k || rc=$?
+              if [ "$rc" -eq 0 ]; then
+                echo "Portainer webhook triggered (TLS verification skipped)."
+                exit 0
+              fi
+            fi
+
+            if [ "$attempt" -lt 5 ]; then
+              echo "Redeploy attempt ${attempt}/5 failed (curl exit ${rc}); retrying in $((attempt * 15))s..."
+              sleep $((attempt * 15))
+            fi
+          done
+
+          echo "::error::Portainer redeploy failed after 5 attempts (last curl exit ${rc}). UNIFI_VERSION is left untouched, so the next scheduled run will retry."
+          exit 1
+
+      # Runs only when every step above succeeded, so UNIFI_VERSION always reflects
+      # a version that is both published and deployed. Never bump it earlier.
       - name: Commit version bump
-        if: steps.version.outputs.should_build == 'true' && steps.version.outputs.target != steps.version.outputs.current
+        if: steps.version.outputs.should_run == 'true' && steps.version.outputs.target != steps.version.outputs.current
         run: |
           set -euo pipefail
           echo "${{ steps.version.outputs.target }}" > UNIFI_VERSION
@@ -97,12 +234,6 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add UNIFI_VERSION
           git commit -m "chore: update UNIFI_VERSION to ${{ steps.version.outputs.target }}"
+          # main may have moved while the build ran.
+          git pull --rebase --autostash origin main
           git push
-
-      - name: Trigger Portainer redeploy
-        if: steps.version.outputs.should_build == 'true'
-        run: |
-          set -euo pipefail
-          echo "Triggering Portainer webhook..."
-          curl -fsSL -X POST "${{ secrets.PORTAINER_WEBHOOK_URL }}"
-          echo "Portainer webhook triggered."

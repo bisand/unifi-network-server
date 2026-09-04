@@ -25,29 +25,14 @@ RUN wget https://raw.githubusercontent.com/gdraheim/docker-systemctl-replacement
 RUN chmod +x /usr/local/bin/systemctl
 
 # Download and install UniFi.
-# Use a single RUN that writes a small expect script via printf to avoid Dockerfile heredoc parsing issues.
-RUN wget https://get.glennr.nl/unifi/install/unifi-${UNIFI_VERSION}.sh -O unifi-${UNIFI_VERSION}.sh && \
-    chmod +x unifi-${UNIFI_VERSION}.sh && \
-    if [ "${RUN_UPDATE}" = "true" ]; then \
-        echo "RUN_UPDATE=true -> creating expect script to select menu option 1 (Update the UniFi OS Server)"; \
-        # Create the expect script without using a Dockerfile heredoc (printf ensures all content is part of this RUN)
-        printf '%s\n' '#!/usr/bin/expect -f' \
-            'set timeout -1' \
-            "spawn ./unifi-${UNIFI_VERSION}.sh --skip --local-install" \
-            'expect {' \
-            '  "What would you like to perform?" { send "1\r"; exp_continue }' \
-            '  eof' \
-            '}' > /tmp/unifi_expect && \
-        chmod +x /tmp/unifi_expect && \
-        expect -f /tmp/unifi_expect || true; \
-    else \
-        echo "RUN_UPDATE is not true -> running installer without automated menu selection"; \
-        ./unifi-${UNIFI_VERSION}.sh --skip --local-install; \
-    fi
+# install-unifi.sh downloads the installer (with retries), drives its menu via
+# expect and then VERIFIES the result, so a failed install fails the build instead
+# of silently publishing a broken image.
+COPY install-unifi.sh /tmp/install-unifi.sh
+RUN chmod +x /tmp/install-unifi.sh && /tmp/install-unifi.sh && rm -f /tmp/install-unifi.sh
 
 # Clean up installer and unneeded packages to keep image smaller
-RUN rm -rf unifi-${UNIFI_VERSION}.sh && \
-    rm -rf unifi_sysvinit_all.deb && \
+RUN rm -rf unifi-${UNIFI_VERSION}.sh unifi_sysvinit_all.deb && \
     apt-get remove -y wget expect && \
     apt-get autoremove -y && \
     apt-get clean && \
@@ -64,7 +49,7 @@ RUN (systemctl enable mongod || true) && \
 
 # Copy entrypoint script
 COPY entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
+RUN chmod +x /entrypoint.sh && [ -x /entrypoint.sh ]
 
 # Start docker with entrypoint
 CMD ["/entrypoint.sh"]
