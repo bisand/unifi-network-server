@@ -12,7 +12,7 @@ on:
         type: boolean
         default: false
       skip_deploy:
-        description: 'Skip the Portainer redeploy'
+        description: 'Build and push only — do not update the homelab manifest'
         type: boolean
         default: false
   schedule:
@@ -28,6 +28,13 @@ concurrency:
 
 env:
   IMAGE: bisand/unifi-network-server
+  # The GitOps repo Flux reconciles the cluster from. Committing the new image
+  # reference there IS the deploy — the cluster pulls, this workflow never
+  # reaches it, and no kubeconfig exists in GitHub. Same shape as regnmed's
+  # images.yml, which is the established pattern for this homelab.
+  HOMELAB_REPO: ssh://git@github.com/bisand/homelab.git
+  HOMELAB_BRANCH: master
+  HOMELAB_MANIFEST: stacks/unifi/unifi.yaml
 
 jobs:
   build-publish:
@@ -166,72 +173,79 @@ jobs:
           TAG="${{ steps.version.outputs.target }}"
           docker buildx imagetools create -t "${IMAGE}:latest" "${IMAGE}:${TAG}"
 
-      - name: Trigger Portainer redeploy
+      # The homelab manifest pins by digest, not by tag, so the deploy needs the
+      # digest whether we just built the image or found it already published.
+      - name: Resolve image digest
+        id: digest
+        if: steps.version.outputs.should_run == 'true'
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.version.outputs.target }}"
+          DIGEST="${{ steps.build.outputs.digest }}"
+          if [ -z "$DIGEST" ]; then
+            DIGEST="$(docker buildx imagetools inspect "${IMAGE}:${TAG}" --format '{{.Manifest.Digest}}')"
+          fi
+          if ! printf '%s' "$DIGEST" | grep -qE '^sha256:[0-9a-f]{64}$'; then
+            echo "::error::Could not resolve a digest for ${IMAGE}:${TAG} (got '${DIGEST}')"
+            exit 1
+          fi
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+          echo "Deploying ${IMAGE}:${TAG}@${DIGEST}"
+
+      # This commit IS the deploy. Flux polls the homelab repo every minute and
+      # reconciles ./stacks every five, so the rollout lands within ~5 minutes
+      # with nothing inbound to the cluster and no kubeconfig in GitHub.
+      - name: Deploy — pin the new image in the homelab repo
         id: deploy
         if: steps.version.outputs.should_run == 'true' && github.event.inputs.skip_deploy != 'true'
         env:
-          WEBHOOK: ${{ secrets.PORTAINER_WEBHOOK_URL }}
-          # Optional: PEM of the CA that signed Portainer's certificate.
-          CA_CERT: ${{ secrets.PORTAINER_CA_CERT }}
-          # Set the repo variable to 'false' to make an untrusted certificate fatal.
-          ALLOW_INSECURE: ${{ vars.PORTAINER_INSECURE_TLS }}
+          DEPLOY_KEY: ${{ secrets.HOMELAB_DEPLOY_KEY }}
+          TAG: ${{ steps.version.outputs.target }}
+          DIGEST: ${{ steps.digest.outputs.digest }}
         run: |
-          set -uo pipefail
-          if [ -z "${WEBHOOK:-}" ]; then
-            echo "::error::PORTAINER_WEBHOOK_URL secret is not set."
+          set -euo pipefail
+          if [ -z "${DEPLOY_KEY:-}" ]; then
+            echo "::error::HOMELAB_DEPLOY_KEY secret is not set — see the Build pipeline section of README.md for how to create it."
             exit 1
           fi
 
-          # Seeded so the array is never empty (empty expansion trips `set -u`).
-          TLS_OPTS=(--show-error)
-          if [ -n "${CA_CERT:-}" ]; then
-            printf '%s\n' "$CA_CERT" > "$RUNNER_TEMP/portainer-ca.pem"
-            TLS_OPTS+=(--cacert "$RUNNER_TEMP/portainer-ca.pem")
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -t rsa,ecdsa,ed25519 github.com >> ~/.ssh/known_hosts 2>/dev/null
+
+          CLONE="$RUNNER_TEMP/homelab"
+          rm -rf "$CLONE"
+          git clone --depth 1 --branch "$HOMELAB_BRANCH" "$HOMELAB_REPO" "$CLONE"
+
+          REF="${IMAGE}:${TAG}@${DIGEST}"
+          python3 .github/scripts/pin-image.py "$CLONE/$HOMELAB_MANIFEST" "$IMAGE" "$REF"
+
+          cd "$CLONE"
+          if git diff --quiet; then
+            echo "$HOMELAB_MANIFEST already pins ${REF} — nothing to deploy."
+            exit 0
           fi
+          git --no-pager diff -- "$HOMELAB_MANIFEST"
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add "$HOMELAB_MANIFEST"
+          git commit -m "unifi: deploy ${TAG}" \
+                     -m "Image ${REF}, published by unifi-network-server run ${GITHUB_RUN_ID}."
 
-          # Retries transient failures only (connection errors, 408, 429, 5xx).
-          # A 404/403 means the webhook itself is gone or wrong — retrying cannot help.
-          post() {
-            curl -sS -o /dev/null -w '%{http_code}' -X POST --max-time 120 \
-              --retry 3 --retry-delay 5 "$@" "$WEBHOOK"
-          }
-
-          for attempt in 1 2 3 4 5; do
-            rc=0
-            code="$(post "${TLS_OPTS[@]}")" || rc=$?
-
-            # curl 60 = the server's certificate could not be verified. Portainer
-            # commonly runs with a self-signed cert; retry unverified unless the
-            # repo has explicitly opted out.
-            if [ "$rc" -eq 60 ] && [ "${ALLOW_INSECURE:-}" != "false" ]; then
-              echo "::warning::Portainer presented an untrusted certificate. Retrying without TLS verification. Set the PORTAINER_CA_CERT secret to pin its CA, or the PORTAINER_INSECURE_TLS repository variable to 'false' to make this fatal."
-              rc=0
-              code="$(post -k "${TLS_OPTS[@]}")" || rc=$?
-              insecure=" (TLS verification skipped)"
-            fi
-
-            if [ "$rc" -eq 0 ] && [ "$code" -ge 200 ] && [ "$code" -lt 300 ]; then
-              echo "Portainer webhook triggered${insecure:-} — HTTP ${code}."
+          # The homelab repo has other authors; rebase rather than fail on a race.
+          for attempt in 1 2 3; do
+            if git push origin "HEAD:$HOMELAB_BRANCH"; then
+              echo "Deployed ${REF} — Flux reconciles within ~5 minutes."
               exit 0
             fi
-
-            # Permanent client errors: stop immediately, the message matters more
-            # than another four minutes of identical failures.
-            case "$code" in
-              404|403|401|400|405|410)
-                echo "::error::Portainer returned HTTP ${code} for the redeploy webhook. The PORTAINER_WEBHOOK_URL secret points at a webhook that no longer exists — Portainer issues a new webhook ID whenever a stack is recreated. Copy the current webhook URL from the stack in Portainer and update the secret. UNIFI_VERSION is left untouched, so the next run will retry."
-                exit 1
-                ;;
-            esac
-
-            if [ "$attempt" -lt 5 ]; then
-              echo "Redeploy attempt ${attempt}/5 failed (curl exit ${rc}, HTTP ${code:-none}); retrying in $((attempt * 15))s..."
-              sleep $((attempt * 15))
-            fi
+            echo "Push rejected (attempt ${attempt}/3); rebasing onto $HOMELAB_BRANCH..."
+            git fetch origin "$HOMELAB_BRANCH"
+            git pull --rebase origin "$HOMELAB_BRANCH"
           done
-
-          echo "::error::Portainer redeploy failed after 5 attempts (last curl exit ${rc}, HTTP ${code:-none}). UNIFI_VERSION is left untouched, so the next scheduled run will retry."
+          echo "::error::Could not push the deploy commit to $HOMELAB_BRANCH after 3 attempts. UNIFI_VERSION is left untouched, so the next run will retry."
           exit 1
+
 
       # Runs only when every step above succeeded, so UNIFI_VERSION always reflects
       # a version that is both published and deployed. Never bump it earlier.
