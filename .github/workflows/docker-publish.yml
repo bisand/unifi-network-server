@@ -182,24 +182,23 @@ jobs:
             exit 1
           fi
 
-          TLS_OPTS=()
+          # Seeded so the array is never empty (empty expansion trips `set -u`).
+          TLS_OPTS=(--show-error)
           if [ -n "${CA_CERT:-}" ]; then
             printf '%s\n' "$CA_CERT" > "$RUNNER_TEMP/portainer-ca.pem"
-            TLS_OPTS=(--cacert "$RUNNER_TEMP/portainer-ca.pem")
+            TLS_OPTS+=(--cacert "$RUNNER_TEMP/portainer-ca.pem")
           fi
 
+          # Retries transient failures only (connection errors, 408, 429, 5xx).
+          # A 404/403 means the webhook itself is gone or wrong — retrying cannot help.
           post() {
-            curl -fsS -X POST --max-time 120 \
-              --retry 3 --retry-delay 5 --retry-all-errors "$@" "$WEBHOOK"
+            curl -sS -o /dev/null -w '%{http_code}' -X POST --max-time 120 \
+              --retry 3 --retry-delay 5 "$@" "$WEBHOOK"
           }
 
           for attempt in 1 2 3 4 5; do
             rc=0
-            post "${TLS_OPTS[@]}" || rc=$?
-            if [ "$rc" -eq 0 ]; then
-              echo "Portainer webhook triggered."
-              exit 0
-            fi
+            code="$(post "${TLS_OPTS[@]}")" || rc=$?
 
             # curl 60 = the server's certificate could not be verified. Portainer
             # commonly runs with a self-signed cert; retry unverified unless the
@@ -207,20 +206,31 @@ jobs:
             if [ "$rc" -eq 60 ] && [ "${ALLOW_INSECURE:-}" != "false" ]; then
               echo "::warning::Portainer presented an untrusted certificate. Retrying without TLS verification. Set the PORTAINER_CA_CERT secret to pin its CA, or the PORTAINER_INSECURE_TLS repository variable to 'false' to make this fatal."
               rc=0
-              post -k || rc=$?
-              if [ "$rc" -eq 0 ]; then
-                echo "Portainer webhook triggered (TLS verification skipped)."
-                exit 0
-              fi
+              code="$(post -k "${TLS_OPTS[@]}")" || rc=$?
+              insecure=" (TLS verification skipped)"
             fi
 
+            if [ "$rc" -eq 0 ] && [ "$code" -ge 200 ] && [ "$code" -lt 300 ]; then
+              echo "Portainer webhook triggered${insecure:-} — HTTP ${code}."
+              exit 0
+            fi
+
+            # Permanent client errors: stop immediately, the message matters more
+            # than another four minutes of identical failures.
+            case "$code" in
+              404|403|401|400|405|410)
+                echo "::error::Portainer returned HTTP ${code} for the redeploy webhook. The PORTAINER_WEBHOOK_URL secret points at a webhook that no longer exists — Portainer issues a new webhook ID whenever a stack is recreated. Copy the current webhook URL from the stack in Portainer and update the secret. UNIFI_VERSION is left untouched, so the next run will retry."
+                exit 1
+                ;;
+            esac
+
             if [ "$attempt" -lt 5 ]; then
-              echo "Redeploy attempt ${attempt}/5 failed (curl exit ${rc}); retrying in $((attempt * 15))s..."
+              echo "Redeploy attempt ${attempt}/5 failed (curl exit ${rc}, HTTP ${code:-none}); retrying in $((attempt * 15))s..."
               sleep $((attempt * 15))
             fi
           done
 
-          echo "::error::Portainer redeploy failed after 5 attempts (last curl exit ${rc}). UNIFI_VERSION is left untouched, so the next scheduled run will retry."
+          echo "::error::Portainer redeploy failed after 5 attempts (last curl exit ${rc}, HTTP ${code:-none}). UNIFI_VERSION is left untouched, so the next scheduled run will retry."
           exit 1
 
       # Runs only when every step above succeeded, so UNIFI_VERSION always reflects
