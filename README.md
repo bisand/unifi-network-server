@@ -52,8 +52,8 @@ volumes:
 ### Build pipeline
 
 `.github/workflows/docker-publish.yml` checks [glennr.nl](https://glennr.nl/s/unifi-network-controller)
-nightly, builds and pushes `bisand/unifi-network-server:<version>` + `:latest`, then deploys by
-committing the new image reference into a GitOps repository.
+for a new release, builds and pushes `bisand/unifi-network-server:<version>` + `:latest`, then deploys
+by committing the new image reference into a GitOps repository.
 
 **The cluster pulls; CI never reaches it.** The deploy step writes
 `image: bisand/unifi-network-server:<version>@sha256:<digest>` into a manifest in that repository,
@@ -62,9 +62,22 @@ kubeconfig exists in GitHub. The digest is what actually pins the rollout — th
 there so the manifest says which version it is running.
 
 `UNIFI_VERSION` records the last version that was **both published and deployed successfully** — it is
-committed only by the final step. Any run that fails leaves it untouched, so the next nightly run
-retries; if the image for that version is already on Docker Hub, the rebuild is skipped and only the
-deploy is retried.
+committed only by the final step. Any run that fails leaves it untouched, so a later run retries; if
+the image for that version is already on Docker Hub, the rebuild is skipped and only the deploy is
+retried.
+
+**A failed publish is retried, not skipped.** Nearly everything that breaks this pipeline is transient
+and someone else's: an apt mirror, the installer download, a Docker Hub 5xx, the Actions cache. So the
+workflow retries at two levels.
+
+*Within a run*, every step that touches the network retries with backoff. The build itself gets three
+attempts that lean on the build cache progressively less — read/write, then read-only, then
+`--no-cache` — so a poisoned or unreachable cache cannot fail all three the same way.
+
+*Across runs*, the schedule fires at 03:00, 09:00, 15:00 and 21:00 UTC. Only the first is really a
+discovery run; the rest exist so a run that exhausted its own retries is picked up within hours rather
+than a full day later, because `UNIFI_VERSION` still lags the target. When there is nothing to do a
+run costs about ten seconds, and the `concurrency` group keeps two publishes from ever overlapping.
 
 This repository is public, so the deploy target is configured entirely through secrets. Nothing about
 the private infrastructure — its repository, branch, layout or addresses — belongs in these files or

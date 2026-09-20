@@ -16,7 +16,12 @@ on:
         type: boolean
         default: false
   schedule:
-    - cron: '0 3 * * *'   # Daily at 03:00 UTC
+    # 03:00 UTC is the discovery run: it notices a new UniFi release and
+    # publishes it. The later slots are retry slots — a run whose own in-run
+    # retries were exhausted gets picked up again within hours instead of
+    # waiting a full day, because UNIFI_VERSION still lags the target. On a
+    # day with nothing to do each one costs about ten seconds.
+    - cron: '0 3,9,15,21 * * *'
 
 permissions:
   contents: write
@@ -52,7 +57,7 @@ jobs:
 
       # UNIFI_VERSION is the "last version that was published AND deployed successfully".
       # It is only bumped by the final step of this workflow, so any run that fails
-      # anywhere leaves it behind and the next nightly run retries the whole thing.
+      # anywhere leaves it behind and the next scheduled run retries the whole thing.
       - name: Determine target version
         id: version
         run: |
@@ -95,7 +100,7 @@ jobs:
           # Confirm the installer for this version actually exists before we spend
           # 5 minutes building an image around a version that cannot be installed.
           if [ "$TARGET" != "$CURRENT" ] || [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            if ! curl -fsSI --max-time 60 --retry 3 --retry-delay 5 \
+            if ! curl -fsSI --max-time 60 --retry 5 --retry-delay 5 --retry-connrefused \
                  "https://get.glennr.nl/unifi/install/unifi-${TARGET}.sh" >/dev/null; then
               echo "::error::No installer available at https://get.glennr.nl/unifi/install/unifi-${TARGET}.sh"
               exit 1
@@ -152,21 +157,73 @@ jobs:
             echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
 
+      # Almost everything that goes wrong here is transient and external: an
+      # apt mirror or the glennr download flaking inside the build, a Docker Hub
+      # 5xx on push, or the GHA cache export dying. Retry in place instead of
+      # failing the run and leaving the publish to the next scheduled one.
+      #
+      # Each attempt leans on the build cache less than the last, so a poisoned
+      # or unreachable cache cannot fail every attempt the same way:
+      #   1. read + write the GHA cache — the fast, normal path
+      #   2. read only  — a failing cache *export* can no longer break the build
+      #   3. no cache   — a corrupt cache entry can no longer break the build
+      # A cold rebuild is roughly six minutes, so three attempts plus backoff
+      # stay well inside the job timeout.
+      #
+      # This is `docker buildx build` rather than docker/build-push-action so the
+      # retry loop and the cache escalation are expressible at all; the flags
+      # mirror what the action was invoking.
       - name: Build and push image
         id: build
         if: steps.version.outputs.should_run == 'true' && steps.published.outputs.exists != 'true'
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          platforms: linux/amd64
-          push: true
-          build-args: |
-            UNIFI_VERSION=${{ steps.version.outputs.target }}
-          tags: |
-            ${{ env.IMAGE }}:${{ steps.version.outputs.target }}
-            ${{ env.IMAGE }}:latest
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+        env:
+          TAG: ${{ steps.version.outputs.target }}
+        run: |
+          set -uo pipefail
+          METADATA="$RUNNER_TEMP/build-metadata.json"
+          ATTEMPTS=3
+
+          for attempt in $(seq 1 "$ATTEMPTS"); do
+            case "$attempt" in
+              1) CACHE_ARGS=(--cache-from type=gha --cache-to type=gha,mode=max) ;;
+              2) CACHE_ARGS=(--cache-from type=gha) ;;
+              *) CACHE_ARGS=(--no-cache) ;;
+            esac
+
+            echo "::group::Build attempt ${attempt}/${ATTEMPTS} (${CACHE_ARGS[*]})"
+            rm -f "$METADATA"
+            # Actions runs this step as `bash -e`, so a bare failing build would
+            # abort the step before the loop ever saw it. `|| status=$?` keeps the
+            # failure ours to handle whether or not -e is in effect.
+            status=0
+            docker buildx build \
+              --platform linux/amd64 \
+              --build-arg "UNIFI_VERSION=${TAG}" \
+              --tag "${IMAGE}:${TAG}" \
+              --tag "${IMAGE}:latest" \
+              --metadata-file "$METADATA" \
+              "${CACHE_ARGS[@]}" \
+              --push \
+              . || status=$?
+            echo "::endgroup::"
+
+            if [ "$status" -eq 0 ]; then
+              # Hand the digest straight to the deploy so it never has to ask the
+              # registry what it was we just pushed.
+              DIGEST="$(jq -r '."containerimage.digest" // empty' "$METADATA")"
+              echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+              echo "Pushed ${IMAGE}:${TAG} (${DIGEST:-digest unresolved}) on attempt ${attempt}."
+              exit 0
+            fi
+
+            if [ "$attempt" -lt "$ATTEMPTS" ]; then
+              echo "::warning::Build attempt ${attempt}/${ATTEMPTS} failed (exit ${status}); retrying in $((attempt * 30))s..."
+              sleep $((attempt * 30))
+            fi
+          done
+
+          echo "::error::Build failed after ${ATTEMPTS} attempts. UNIFI_VERSION is left untouched, so the next scheduled run retries."
+          exit 1
 
       # An already-published tag still needs :latest pointing at it — cheap manifest
       # copy, no rebuild.
@@ -175,7 +232,8 @@ jobs:
         run: |
           set -euo pipefail
           TAG="${{ steps.version.outputs.target }}"
-          docker buildx imagetools create -t "${IMAGE}:latest" "${IMAGE}:${TAG}"
+          .github/scripts/retry.sh 3 10 -- \
+            docker buildx imagetools create -t "${IMAGE}:latest" "${IMAGE}:${TAG}"
 
       # The deploy manifest pins by digest, not by tag, so the deploy needs the
       # digest whether we just built the image or found it already published.
@@ -187,7 +245,11 @@ jobs:
           TAG="${{ steps.version.outputs.target }}"
           DIGEST="${{ steps.build.outputs.digest }}"
           if [ -z "$DIGEST" ]; then
-            DIGEST="$(docker buildx imagetools inspect "${IMAGE}:${TAG}" --format '{{.Manifest.Digest}}')"
+            # The image is known to exist by this point — either we just pushed it
+            # or we found it already published — so a failure here is the registry
+            # flaking, not a missing tag. Retry instead of losing the deploy.
+            DIGEST="$(.github/scripts/retry.sh 3 10 -- \
+              docker buildx imagetools inspect "${IMAGE}:${TAG}" --format '{{.Manifest.Digest}}')"
           fi
           if ! printf '%s' "$DIGEST" | grep -qE '^sha256:[0-9a-f]{64}$'; then
             echo "::error::Could not resolve a digest for ${IMAGE}:${TAG} (got '${DIGEST}')"
@@ -226,8 +288,18 @@ jobs:
           ssh-keyscan -t rsa,ecdsa,ed25519 github.com >> ~/.ssh/known_hosts 2>/dev/null
 
           CLONE="$RUNNER_TEMP/gitops"
-          rm -rf "$CLONE"
-          git clone --quiet --depth 1 --branch "$DEPLOY_BRANCH" "$DEPLOY_REPO" "$CLONE"
+          for attempt in 1 2 3; do
+            rm -rf "$CLONE"
+            if git clone --quiet --depth 1 --branch "$DEPLOY_BRANCH" "$DEPLOY_REPO" "$CLONE"; then
+              break
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              echo "::error::Could not clone the GitOps repo after 3 attempts."
+              exit 1
+            fi
+            echo "Clone failed (attempt ${attempt}/3); retrying in $((attempt * 5))s..."
+            sleep $((attempt * 5))
+          done
 
           REF="${IMAGE}:${TAG}@${DIGEST}"
           python3 .github/scripts/pin-image.py "$CLONE/$DEPLOY_MANIFEST" "$IMAGE" "$REF" >/dev/null
@@ -250,6 +322,7 @@ jobs:
               exit 0
             fi
             echo "Push rejected (attempt ${attempt}/3); rebasing and retrying..."
+            sleep $((attempt * 5))
             git fetch --quiet origin "$DEPLOY_BRANCH"
             git pull --quiet --rebase origin "$DEPLOY_BRANCH"
           done
@@ -267,6 +340,19 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add UNIFI_VERSION
           git commit -m "chore: update UNIFI_VERSION to ${{ steps.version.outputs.target }}"
-          # main may have moved while the build ran.
-          git pull --rebase --autostash origin main
-          git push
+
+          # main may have moved while the build ran. This commit is the record of
+          # "published AND deployed"; if it never lands, the next run rebuilds and
+          # redeploys a version that is already live — so retry rather than let a
+          # push race undo the whole run.
+          for attempt in 1 2 3; do
+            if ! git pull --rebase --autostash origin main; then
+              echo "Rebase onto origin/main failed (attempt ${attempt}/3)."
+            elif git push; then
+              exit 0
+            fi
+            echo "Version bump push failed (attempt ${attempt}/3); retrying in $((attempt * 5))s..."
+            sleep $((attempt * 5))
+          done
+          echo "::error::Could not push the UNIFI_VERSION bump after 3 attempts."
+          exit 1
