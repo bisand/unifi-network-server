@@ -87,6 +87,15 @@ workflow retries at two levels.
 attempts that lean on the build cache progressively less — read/write, then read-only, then
 `--no-cache` — so a poisoned or unreachable cache cannot fail all three the same way.
 
+**Every run reports how long since the last publish.** A skipped release and a genuinely quiet night
+both look like a green ten-second run, which is how the cluster once sat weeks behind with nothing
+appearing wrong. The run summary now always carries `last publish: N day(s) ago`, and past 45 days
+(`STALE_AFTER_DAYS`) the run raises a warning. It warns rather than fails deliberately: the standalone
+Network Server is being sunset, so upstream going quiet for good is an expected end state and failing
+on it would become permanent noise. Note the limit — a workflow that GitHub has disabled for
+inactivity cannot warn about itself; re-enable that by hand with
+`gh workflow enable docker-publish.yml`.
+
 *Across runs*, the schedule fires at 03:00, 09:00, 15:00 and 21:00 UTC. Only the first is really a
 discovery run; the rest exist so a run that exhausted its own retries is picked up within hours rather
 than a full day later, because `UNIFI_VERSION` still lags the target. When there is nothing to do a
