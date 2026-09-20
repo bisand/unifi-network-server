@@ -51,9 +51,22 @@ volumes:
 
 ### Build pipeline
 
-`.github/workflows/docker-publish.yml` checks [glennr.nl](https://glennr.nl/s/unifi-network-controller)
-for a new release, builds and pushes `bisand/unifi-network-server:<version>` + `:latest`, then deploys
-by committing the new image reference into a GitOps repository.
+`.github/workflows/docker-publish.yml` checks for a new release, builds and pushes
+`bisand/unifi-network-server:<version>` + `:latest`, then deploys by committing the new image
+reference into a GitOps repository.
+
+**Version detection reads two sources**, because either can lag. Ubiquiti's release feed
+(`fw-update.ubnt.com`) is what the controller's own *"Update to Network Application X available"*
+notice reads, so it is authoritative for what the newest release is;
+[glennr.nl](https://glennr.nl/s/unifi-network-controller) is kept as a second opinion so detection
+degrades rather than dies if that feed moves. The workflow takes the newest version either source
+reports, then builds the newest one glennr actually ships an installer for — Ubiquiti usually
+announces a release a little before that script appears, which is a wait, not a failure.
+
+This matters: for a while the workflow read only the glennr page, which listed 10.6.101 as newest
+while already serving an installer for 10.6.106. Nothing failed and nothing alerted — every run just
+concluded there was no new release and exited in ten seconds, so the cluster quietly sat on a stale
+version. A single lagging source must not be able to do that.
 
 **The cluster pulls; CI never reaches it.** The deploy step writes
 `image: bisand/unifi-network-server:<version>@sha256:<digest>` into a manifest in that repository,

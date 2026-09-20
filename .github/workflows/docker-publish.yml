@@ -58,6 +58,14 @@ jobs:
       # UNIFI_VERSION is the "last version that was published AND deployed successfully".
       # It is only bumped by the final step of this workflow, so any run that fails
       # anywhere leaves it behind and the next scheduled run retries the whole thing.
+      #
+      # Version detection reads TWO independent sources and takes the newest
+      # buildable one. It used to read only glennr's HTML page, which on
+      # 2026-09-20 was found still listing 10.6.101 as newest while already
+      # serving an installer for 10.6.106. Nothing failed and nothing alerted —
+      # every run just decided there was no new release and exited in ten
+      # seconds, so the cluster silently sat on a stale version. One lagging
+      # source must not be able to do that again.
       - name: Determine target version
         id: version
         run: |
@@ -65,43 +73,92 @@ jobs:
           CURRENT="$(tr -d '[:space:]' < UNIFI_VERSION)"
           OVERRIDE="${{ github.event.inputs.version }}"
 
+          # The build installs via glennr's per-version script, so a release is
+          # only buildable once that script exists — whoever has announced it.
+          installer_exists() {
+            curl -fsSI --max-time 60 --retry 5 --retry-delay 5 --retry-connrefused \
+                 "https://get.glennr.nl/unifi/install/unifi-$1.sh" >/dev/null 2>&1
+          }
+
           if [ -n "$OVERRIDE" ]; then
             TARGET="$OVERRIDE"
             echo "Using version override: $TARGET"
+            if ! printf '%s' "$TARGET" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+              echo "::error::Version override '${TARGET}' is not a valid version."
+              exit 1
+            fi
+            # An explicit request for a version we cannot build is an error, not
+            # something to quietly work around.
+            if ! installer_exists "$TARGET"; then
+              echo "::error::No installer available at https://get.glennr.nl/unifi/install/unifi-${TARGET}.sh"
+              exit 1
+            fi
           else
-            # Retry the version feed — a transient fetch failure must not look like
-            # "no new version" and must not fail the run outright on the first try.
-            TARGET=""
+            # Source 1 — Ubiquiti's own release feed. This is what the controller's
+            # "Update to Network Application X available" notice reads, so it is
+            # authoritative for what the newest release actually is.
+            UBNT=""
+            for attempt in 1 2 3; do
+              if curl -sSL --max-time 60 -o ubnt.json \
+                   "https://fw-update.ubnt.com/api/firmware-latest?filter=eq~~product~~unifi-controller&filter=eq~~channel~~release"; then
+                UBNT="$(jq -r '[._embedded.firmware[]?.version] | .[]' ubnt.json 2>/dev/null \
+                        | sed 's/^v//; s/+.*//' \
+                        | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n1 || true)"
+                if [ -n "$UBNT" ]; then break; fi
+              fi
+              echo "Ubiquiti release feed unavailable (attempt ${attempt}/3); retrying in $((attempt * 5))s..."
+              sleep $((attempt * 5))
+            done
+            rm -f ubnt.json
+
+            # Source 2 — glennr's page. Kept as a second opinion so that if the
+            # Ubiquiti feed moves or breaks, detection degrades instead of dying.
+            PAGE=""
             for attempt in 1 2 3 4 5; do
               if curl -sSL --max-time 60 -o unifi-install.html https://glennr.nl/s/unifi-network-controller; then
-                TARGET="$(grep -oP 'unifi-\K[0-9]+\.[0-9]+\.[0-9]+' unifi-install.html | sort -V | tail -n1 || true)"
-                if [ -n "$TARGET" ]; then break; fi
+                PAGE="$(grep -oP 'unifi-\K[0-9]+\.[0-9]+\.[0-9]+' unifi-install.html | sort -V | tail -n1 || true)"
+                if [ -n "$PAGE" ]; then break; fi
               fi
-              echo "Version detection failed (attempt ${attempt}/5); retrying in $((attempt * 10))s..."
+              echo "Version page unavailable (attempt ${attempt}/5); retrying in $((attempt * 10))s..."
               sleep $((attempt * 10))
             done
             rm -f unifi-install.html
-            echo "Latest detected version: ${TARGET:-<none>}"
-          fi
 
-          if ! printf '%s' "$TARGET" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
-            echo "::error::Could not determine a valid target UniFi version (got '${TARGET}')"
-            exit 1
-          fi
+            echo "Detected — ubiquiti: ${UBNT:-<none>}, glennr page: ${PAGE:-<none>}, current: ${CURRENT}"
 
-          # A bad parse of the feed must never downgrade :latest. Only an explicit
-          # override may move the version backwards.
-          NEWEST="$(printf '%s\n%s\n' "$CURRENT" "$TARGET" | sort -V | tail -n1)"
-          if [ -z "$OVERRIDE" ] && [ "$TARGET" != "$CURRENT" ] && [ "$NEWEST" != "$TARGET" ]; then
-            echo "::warning::Detected version $TARGET is older than the current $CURRENT — ignoring."
+            if [ -z "$UBNT" ] && [ -z "$PAGE" ]; then
+              echo "::error::Both version sources are unavailable — cannot determine a target."
+              exit 1
+            fi
+
+            # Newest candidate first; take the newest that is actually buildable.
+            # Staying on CURRENT is the safe default, so a bad parse can never
+            # downgrade :latest — only an explicit override may move backwards.
             TARGET="$CURRENT"
+            for CANDIDATE in $(printf '%s\n%s\n' "$UBNT" "$PAGE" \
+                               | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V -r -u); do
+              if [ "$(printf '%s\n%s\n' "$CANDIDATE" "$CURRENT" | sort -V | tail -n1)" != "$CANDIDATE" ]; then
+                echo "Ignoring ${CANDIDATE}: older than the current ${CURRENT}."
+                continue
+              fi
+              if [ "$CANDIDATE" = "$CURRENT" ]; then
+                break
+              fi
+              if installer_exists "$CANDIDATE"; then
+                TARGET="$CANDIDATE"
+                break
+              fi
+              # Ubiquiti routinely announces a release before glennr ships its
+              # installer. That is a wait, not a failure — leave UNIFI_VERSION
+              # alone and let a later run pick it up once the script appears.
+              echo "::warning::UniFi ${CANDIDATE} is released but glennr has no installer for it yet — a later run will pick it up."
+            done
           fi
 
-          # Confirm the installer for this version actually exists before we spend
-          # 5 minutes building an image around a version that cannot be installed.
-          if [ "$TARGET" != "$CURRENT" ] || [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            if ! curl -fsSI --max-time 60 --retry 5 --retry-delay 5 --retry-connrefused \
-                 "https://get.glennr.nl/unifi/install/unifi-${TARGET}.sh" >/dev/null; then
+          # A manual dispatch rebuilds whatever the target is, including CURRENT,
+          # so confirm that is buildable before spending minutes on it.
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -z "$OVERRIDE" ]; then
+            if ! installer_exists "$TARGET"; then
               echo "::error::No installer available at https://get.glennr.nl/unifi/install/unifi-${TARGET}.sh"
               exit 1
             fi
@@ -121,6 +178,8 @@ jobs:
           {
             echo "### UniFi publish"
             echo "- last successful: \`$CURRENT\`"
+            echo "- ubiquiti feed:   \`${UBNT:-n/a}\`"
+            echo "- glennr page:     \`${PAGE:-n/a}\`"
             echo "- target:          \`$TARGET\`"
             echo "- run:             \`$SHOULD_RUN\`"
           } >> "$GITHUB_STEP_SUMMARY"
